@@ -78,6 +78,17 @@ const WORKFLOWS = [
 ];
 
 async function main() {
+  // Self-healing: seed whenever the roster is empty, regardless of how the
+  // database file came to exist. Never touches a non-empty roster.
+  const existingAgents = await db
+    .select({ id: schema.agents.id })
+    .from(schema.agents)
+    .limit(1);
+  if (existingAgents.length > 0) {
+    console.log("Agents table not empty — skipping seed.");
+    return;
+  }
+
   for (const a of CORE) {
     const spec = defaultSpec(a.name, a.role, a.specialty, {
       maxSteps: a.id === "atlas" ? 20 : 12,

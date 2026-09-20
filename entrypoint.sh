@@ -5,16 +5,8 @@ set -e
 : "${DATABASE_URL:=file:/data/dispatch.db}"
 export DATABASE_URL
 
-DB_FILE=$(echo "$DATABASE_URL" | sed 's/^file://')
-FRESH=0
-if [ ! -f "$DB_FILE" ]; then
-  FRESH=1
-fi
-
+# Sync schema, then seed (the seed is a no-op unless the roster is empty).
 npx drizzle-kit push
-
-if [ "$FRESH" = "1" ]; then
-  npx tsx scripts/seed.ts
-fi
+npx tsx scripts/seed.ts
 
 exec node server.js
