@@ -1,0 +1,5 @@
+node_modules
+.next
+dispatch.db
+.env*
+!.env.example

@@ -1,0 +1,10 @@
+node_modules
+.next
+dispatch.db
+.env.local
+.env*.local
+*.log
+.git
+fly.toml
+Dockerfile
+.dockerignore
