@@ -67,6 +67,7 @@ export interface AgentDTO {
   specialty: string;
   hue: number;
   face: FaceConfig;
+  avatarUrl: string | null; // photo portrait URL, null = cartoon Emblem fallback
   isCore: boolean;
   spec: AgentSpec;
   status: AgentStatus;

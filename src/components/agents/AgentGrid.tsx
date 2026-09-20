@@ -17,7 +17,7 @@ export function AgentCard({ agent, stats }: { agent: AgentDTO; stats?: AgentStat
   return (
     <Link href={`/agents/${agent.id}`} className="agent-card">
       <span className="emblem">
-        <Emblem hue={agent.hue} face={agent.face} uid={`card-${agent.id}`} />
+        <Emblem hue={agent.hue} face={agent.face} uid={`card-${agent.id}`} photoUrl={agent.avatarUrl} />
         <span className={`badge${running ? " running" : ""}`}>{running ? "Running" : "Idle"}</span>
       </span>
       <span className="agent-card-body">

@@ -100,7 +100,11 @@ function Bust({ face, hue }: { face: FaceConfig; hue: number }) {
   );
 }
 
-export function Emblem({ hue, face, uid }: { hue: number; face: FaceConfig; uid: string }) {
+export function Emblem({ hue, face, uid, photoUrl }: { hue: number; face: FaceConfig; uid: string; photoUrl?: string | null }) {
+  if (photoUrl) {
+    // Photorealistic portrait — fills the same emblem slot as the cartoon SVG.
+    return <img className="emblem-photo" src={photoUrl} alt="" aria-hidden="true" draggable={false} />;
+  }
   const c = hueColors(hue);
   const gid = `grad-${uid}`;
   return (

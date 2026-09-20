@@ -21,7 +21,7 @@ export default async function AgentDetail({ params }: { params: Promise<{ id: st
     <section>
       <div className="detail-hero">
         <div className="detail-emblem">
-          <Emblem hue={agent.hue} face={agent.face} uid={`detail-${agent.id}`} />
+          <Emblem hue={agent.hue} face={agent.face} uid={`detail-${agent.id}`} photoUrl={agent.avatarUrl} />
         </div>
         <div className="detail-info">
           <h2>{agent.name}</h2>

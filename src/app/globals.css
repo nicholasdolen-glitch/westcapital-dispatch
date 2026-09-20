@@ -109,6 +109,7 @@ a{color:var(--accent)}
 @media (prefers-reduced-motion:reduce){.agent-card:hover{transform:none}}
 .emblem{position:relative;aspect-ratio:16/8.5;width:100%;display:block}
 .emblem svg{position:absolute;inset:0;width:100%;height:100%}
+.emblem-photo{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 20%}
 .badge{
   position:absolute;top:10px;right:10px;font-size:11.5px;font-weight:600;border-radius:20px;
   padding:2px 10px;background:var(--surface);color:var(--queued);border:1px solid var(--line);

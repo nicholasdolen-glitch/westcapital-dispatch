@@ -11,6 +11,7 @@ export function toAgentDTO(row: typeof schema.agents.$inferSelect): AgentDTO {
     specialty: row.specialty,
     hue: row.hue,
     face: JSON.parse(row.face) as FaceConfig,
+    avatarUrl: row.avatarUrl ?? null,
     isCore: row.isCore,
     spec: parseSpec(row.spec, row.name, row.role, row.specialty),
     status: row.status === "paused" ? "paused" : "active",

@@ -1,4 +1,5 @@
 import { db, schema } from "../src/db";
+import { and, eq, isNull } from "drizzle-orm";
 import { newId } from "../src/lib/id";
 import { defaultSpec } from "../src/lib/agentSpec";
 import type { FaceConfig } from "../src/lib/types";
@@ -85,7 +86,14 @@ async function main() {
     .from(schema.agents)
     .limit(1);
   if (existingAgents.length > 0) {
-    console.log("Agents table not empty — skipping seed.");
+    // Backfill photorealistic portraits for core agents seeded before avatarUrl existed.
+    for (const a of CORE) {
+      await db
+        .update(schema.agents)
+        .set({ avatarUrl: `/avatars/${a.id}.jpg` })
+        .where(and(eq(schema.agents.id, a.id), isNull(schema.agents.avatarUrl)));
+    }
+    console.log("Agents table not empty — backfilled core avatar URLs, skipping seed.");
     return;
   }
 
@@ -98,6 +106,7 @@ async function main() {
       .values({
         ...a,
         face: JSON.stringify(a.face),
+        avatarUrl: `/avatars/${a.id}.jpg`,
         isCore: true,
         spec: JSON.stringify(spec),
         status: "active",
@@ -110,6 +119,7 @@ async function main() {
           specialty: a.specialty,
           hue: a.hue,
           face: JSON.stringify(a.face),
+          avatarUrl: `/avatars/${a.id}.jpg`,
           isCore: true,
           spec: JSON.stringify(spec),
           status: "active",

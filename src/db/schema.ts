@@ -21,6 +21,7 @@ export const agents = sqliteTable("agents", {
   specialty: text("specialty").notNull(),
   hue: integer("hue").notNull(),
   face: text("face").notNull(), // JSON FaceConfig
+  avatarUrl: text("avatar_url"), // photorealistic portrait in /public/avatars, null = cartoon fallback
   isCore: integer("is_core", { mode: "boolean" }).notNull().default(false),
   spec: text("spec").notNull().default("{}"), // JSON AgentSpec, zod-validated at API boundary
   status: text("status").notNull().default("active"), // active | paused (zod enum)
