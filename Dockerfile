@@ -27,11 +27,13 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 # Full modules + project files needed by the entrypoint's db setup
-# (drizzle-kit and tsx are devDependencies, not in the traced output)
+# (drizzle-kit and tsx are devDependencies, not in the traced output).
+# The whole src tree is included so helper scripts (seed, etc.) can resolve
+# their imports (src/lib/*) at boot.
 COPY --from=deps --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
 COPY --from=builder --chown=nextjs:nodejs /app/drizzle.config.ts ./drizzle.config.ts
-COPY --from=builder --chown=nextjs:nodejs /app/src/db ./src/db
+COPY --from=builder --chown=nextjs:nodejs /app/src ./src
 COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
 COPY --chown=nextjs:nodejs entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
