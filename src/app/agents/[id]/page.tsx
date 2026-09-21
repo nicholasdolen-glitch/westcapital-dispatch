@@ -1,6 +1,8 @@
 import { notFound } from "next/navigation";
 import { Emblem } from "@/components/avatar/Emblem";
 import { getAgent, agentStats, agentSubNodes } from "@/server/queries";
+import { getChatMessages } from "@/server/chat";
+import { AgentChat } from "@/components/chat/AgentChat";
 import { LEAD_ID } from "@/lib/types";
 import { RemoveAgentButton } from "@/components/agents/RemoveAgentButton";
 
@@ -16,6 +18,7 @@ export default async function AgentDetail({ params }: { params: Promise<{ id: st
   const total = (s?.done ?? 0) + (s?.failed ?? 0);
   const rate = total ? `${Math.round(((s?.done ?? 0) / total) * 100)}%` : "–";
   const avg = s?.done ? `${(s.totalMs / s.done / 1000).toFixed(1)}s` : "–";
+  const chatMessages = agent.status === "active" ? await getChatMessages(id) : [];
 
   return (
     <section>
@@ -56,6 +59,14 @@ export default async function AgentDetail({ params }: { params: Promise<{ id: st
         </div>
         {!agent.isCore && <RemoveAgentButton id={agent.id} name={agent.name} />}
       </div>
+
+      {agent.status === "active" && (
+        <AgentChat
+          agentId={agent.id}
+          agentName={agent.name}
+          initialMessages={chatMessages}
+        />
+      )}
 
       <div className="panel" style={{ marginBottom: 18 }}>
         <h3>Agent spec</h3>

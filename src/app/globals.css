@@ -357,6 +357,9 @@ dialog label{font-size:13.5px;color:var(--ink2);display:flex;flex-direction:colu
 .chat-input{flex:1;border:1px solid var(--line2);border-radius:12px;padding:11px 14px;font-size:14.5px;background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
 .chat-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .chat-send{flex:none;padding:11px 22px}
+.agent-chat-panel{margin-bottom:18px}
+.agent-chat-messages{display:flex;flex-direction:column;gap:12px;overflow-y:auto;min-height:120px;max-height:340px;padding:4px 2px;margin:12px 0}
+.agent-chat-input-row{display:flex;gap:10px}
 @media(max-width:760px){
   .chat-wrap{flex-direction:column}
   .chat-agents{flex-direction:row;overflow-x:auto;max-width:none;min-width:0;padding-bottom:4px}
