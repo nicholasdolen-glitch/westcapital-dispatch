@@ -30,12 +30,23 @@ export default async function CommandCenter() {
                 <span>Dispatch your first mission to see activity here.</span>
               </div>
             ) : (
-              events.map((e) => (
-                <div key={e.id} className="feed-item">
-                  <span className="feed-time">{eventTime(e)}</span>
-                  <span>{eventText(e)}</span>
-                </div>
-              ))
+              events.map((e) => {
+                const inner = (
+                  <>
+                    <span className="feed-time">{eventTime(e)}</span>
+                    <span>{eventText(e)}</span>
+                  </>
+                );
+                return e.runId ? (
+                  <Link key={e.id} href={`/runs/${e.runId}`} className="feed-item">
+                    {inner}
+                  </Link>
+                ) : (
+                  <div key={e.id} className="feed-item">
+                    {inner}
+                  </div>
+                );
+              })
             )}
           </div>
         </div>

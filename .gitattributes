@@ -1,0 +1,4 @@
+# Enforce LF line endings for shell scripts so Windows checkouts
+# (core.autocrlf) don't break the Docker entrypoint's shebang.
+*.sh text eol=lf
+entrypoint.sh text eol=lf

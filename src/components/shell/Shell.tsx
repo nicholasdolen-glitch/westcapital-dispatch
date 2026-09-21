@@ -62,6 +62,15 @@ const NAV = [
       </svg>
     ),
   },
+  {
+    href: "/chat",
+    label: "Chat",
+    icon: (
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7">
+        <path d="M3 4.5h14v9H9l-4.5 3.5v-3.5H3v-9Z" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
 ];
 
 export function Shell({

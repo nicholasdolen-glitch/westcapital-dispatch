@@ -138,6 +138,24 @@ export const settings = sqliteTable("settings", {
   value: text("value").notNull(), // JSON
 });
 
+/**
+ * Chat with teammates: one persistent conversation per agent.
+ * Roles are "user" | "assistant"; the API layer enforces the enum with zod.
+ */
+export const chatMessages = sqliteTable(
+  "chat_messages",
+  {
+    id: text("id").primaryKey(),
+    agentId: text("agent_id").references(() => agents.id, { onDelete: "cascade" }),
+    role: text("role").notNull(),
+    content: text("content").notNull(),
+    at: integer("at", { mode: "timestamp_ms" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (t) => [index("chat_messages_agent_at_idx").on(t.agentId, t.at)],
+);
+
 export type AgentRow = typeof agents.$inferSelect;
 export type WorkflowRow = typeof workflows.$inferSelect;
 export type RunRow = typeof runs.$inferSelect;

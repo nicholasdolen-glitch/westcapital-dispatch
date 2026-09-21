@@ -20,7 +20,10 @@ export default async function AgentDetail({ params }: { params: Promise<{ id: st
   return (
     <section>
       <div className="detail-hero">
-        <div className="detail-emblem">
+        <div
+          className="detail-emblem"
+          style={{ "--hue": agent.hue } as React.CSSProperties}
+        >
           <Emblem hue={agent.hue} face={agent.face} uid={`detail-${agent.id}`} photoUrl={agent.avatarUrl} />
         </div>
         <div className="detail-info">

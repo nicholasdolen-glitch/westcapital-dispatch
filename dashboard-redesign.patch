@@ -1,0 +1,1196 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..d09d7d1
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,4 @@
++# Enforce LF line endings for shell scripts so Windows checkouts
++# (core.autocrlf) don't break the Docker entrypoint's shebang.
++*.sh text eol=lf
++entrypoint.sh text eol=lf
+diff --git a/Dockerfile b/Dockerfile
+index 70c69e2..acc9984 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -36,7 +36,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/drizzle.config.ts ./drizzle.confi
+ COPY --from=builder --chown=nextjs:nodejs /app/src ./src
+ COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
+ COPY --chown=nextjs:nodejs entrypoint.sh ./entrypoint.sh
+-RUN chmod +x ./entrypoint.sh
++# Strip any Windows (CRLF) line endings: a stray \r breaks the #!/bin/sh
++# shebang and the machine crash-loops with "No such file or directory".
++RUN chmod +x ./entrypoint.sh && sed -i 's/\r$//' ./entrypoint.sh
+ 
+ USER nextjs
+ EXPOSE 8080
+diff --git a/fly.toml b/fly.toml
+index 02ba290..bf170c8 100644
+--- a/fly.toml
++++ b/fly.toml
+@@ -1,4 +1,4 @@
+-app = "westcapital-dispatch"
++app = "wcl-dispatch"
+ primary_region = "sjc"
+ 
+ [build]
+diff --git a/src/app/activity/page.tsx b/src/app/activity/page.tsx
+index a8ebdb5..b00efe6 100644
+--- a/src/app/activity/page.tsx
++++ b/src/app/activity/page.tsx
+@@ -1,3 +1,4 @@
++import Link from "next/link";
+ import { recentEvents } from "@/server/queries";
+ import { eventText, eventTime } from "@/lib/eventText";
+ 
+@@ -17,12 +18,23 @@ export default async function Activity() {
+             <span>Nothing yet.</span>
+           </div>
+         ) : (
+-          events.map((e) => (
+-            <div key={e.id} className="feed-item">
+-              <span className="feed-time">{eventTime(e)}</span>
+-              <span>{eventText(e)}</span>
+-            </div>
+-          ))
++          events.map((e) => {
++            const inner = (
++              <>
++                <span className="feed-time">{eventTime(e)}</span>
++                <span>{eventText(e)}</span>
++              </>
++            );
++            return e.runId ? (
++              <Link key={e.id} href={`/runs/${e.runId}`} className="feed-item">
++                {inner}
++              </Link>
++            ) : (
++              <div key={e.id} className="feed-item">
++                {inner}
++              </div>
++            );
++          })
+         )}
+       </div>
+     </section>
+diff --git a/src/app/agents/[id]/page.tsx b/src/app/agents/[id]/page.tsx
+index 0f436c7..9598f20 100644
+--- a/src/app/agents/[id]/page.tsx
++++ b/src/app/agents/[id]/page.tsx
+@@ -20,7 +20,10 @@ export default async function AgentDetail({ params }: { params: Promise<{ id: st
+   return (
+     <section>
+       <div className="detail-hero">
+-        <div className="detail-emblem">
++        <div
++          className="detail-emblem"
++          style={{ "--hue": agent.hue } as React.CSSProperties}
++        >
+           <Emblem hue={agent.hue} face={agent.face} uid={`detail-${agent.id}`} photoUrl={agent.avatarUrl} />
+         </div>
+         <div className="detail-info">
+diff --git a/src/app/api/chat/[agentId]/route.ts b/src/app/api/chat/[agentId]/route.ts
+new file mode 100644
+index 0000000..86a1e65
+--- /dev/null
++++ b/src/app/api/chat/[agentId]/route.ts
+@@ -0,0 +1,85 @@
++import { NextResponse } from "next/server";
++import { chatMessageSchema } from "@/server/validation";
++import {
++  getChatMessages,
++  loadChatAgent,
++  saveChatMessage,
++  streamChatReply,
++} from "@/server/chat";
++
++export const dynamic = "force-dynamic";
++
++/** Conversation history with a teammate. */
++export async function GET(
++  _req: Request,
++  ctx: { params: Promise<{ agentId: string }> },
++) {
++  const { agentId } = await ctx.params;
++  const agent = await loadChatAgent(agentId);
++  if (!agent) return NextResponse.json({ error: "No such teammate." }, { status: 404 });
++  return NextResponse.json({ messages: await getChatMessages(agentId) });
++}
++
++/**
++ * Send a message to a teammate. Streams the reply as SSE:
++ *   event: delta  data: {"text": "..."}
++ *   event: done   data: {"message": {...}}
++ *   event: error  data: {"error": "..."}
++ */
++export async function POST(
++  req: Request,
++  ctx: { params: Promise<{ agentId: string }> },
++) {
++  const { agentId } = await ctx.params;
++  const agent = await loadChatAgent(agentId);
++  if (!agent) return NextResponse.json({ error: "No such teammate." }, { status: 404 });
++
++  const body = await req.json().catch(() => null);
++  const parsed = chatMessageSchema.safeParse(body);
++  if (!parsed.success) {
++    return NextResponse.json({ error: "Say something first." }, { status: 400 });
++  }
++
++  await saveChatMessage(agentId, "user", parsed.data.content);
++
++  const encoder = new TextEncoder();
++  let closed = false;
++  req.signal.addEventListener("abort", () => {
++    closed = true;
++  });
++
++  const stream = new ReadableStream({
++    async start(controller) {
++      const send = (event: string, data: string) => {
++        if (!closed) controller.enqueue(encoder.encode(`event: ${event}\ndata: ${data}\n\n`));
++      };
++      let full = "";
++      try {
++        full = await streamChatReply(agent, (delta) => {
++          send("delta", JSON.stringify({ text: delta }));
++        });
++      } catch (err) {
++        send(
++          "error",
++          JSON.stringify({ error: err instanceof Error ? err.message : "Reply failed." }),
++        );
++      }
++      // Persist the reply even if the client disconnected mid-stream.
++      if (full.trim()) {
++        const saved = await saveChatMessage(agentId, "assistant", full);
++        send("done", JSON.stringify({ message: saved }));
++      } else if (!closed) {
++        send("error", JSON.stringify({ error: "The teammate went quiet — try again." }));
++      }
++      if (!closed) controller.close();
++    },
++  });
++
++  return new Response(stream, {
++    headers: {
++      "content-type": "text/event-stream",
++      "cache-control": "no-cache",
++      connection: "keep-alive",
++    },
++  });
++}
+diff --git a/src/app/chat/page.tsx b/src/app/chat/page.tsx
+new file mode 100644
+index 0000000..1f888c2
+--- /dev/null
++++ b/src/app/chat/page.tsx
+@@ -0,0 +1,37 @@
++import { listAgents } from "@/server/queries";
++import { getChatMessages } from "@/server/chat";
++import { ChatClient } from "@/components/chat/ChatClient";
++
++export const dynamic = "force-dynamic";
++
++export default async function ChatPage({
++  searchParams,
++}: {
++  searchParams: Promise<{ agent?: string }>;
++}) {
++  const agents = await listAgents();
++  const active = agents.filter((a) => a.status === "active");
++  const params = await searchParams;
++  const selected =
++    active.find((a) => a.id === params.agent) ??
++    active.find((a) => a.id === "atlas") ??
++    active[0];
++
++  const initialMessages = selected ? await getChatMessages(selected.id) : [];
++
++  return (
++    <section>
++      <div className="view-head">
++        <h2>Chat</h2>
++        <span className="sub">Talk directly with your teammates.</span>
++      </div>
++      {selected ? (
++        <ChatClient agents={active} initialAgentId={selected.id} initialMessages={initialMessages} />
++      ) : (
++        <div className="feed-item">
++          <span>No active teammates yet.</span>
++        </div>
++      )}
++    </section>
++  );
++}
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 0abc3ce..6b84a21 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -2,160 +2,209 @@
+   box-sizing:border-box;
+   padding-top:env(safe-area-inset-top,0px);
+   padding-bottom:env(safe-area-inset-bottom,0px);
+-  --bg:#EDF0F4; --surface:#FFFFFF; --surface2:#F4F6F9; --ink:#1B2430; --ink2:#5A6B7E;
+-  --line:#D8DFE7; --line2:#C2CCD8;
+-  --accent:#2E5BFF; --accent-ink:#FFFFFF;
++  --bg:#E9EDF3; --surface:#FFFFFF; --surface2:#F3F5F9; --ink:#1B2430; --ink2:#5A6B7E;
++  --line:#D9E0E9; --line2:#BFC9D8;
++  --accent:#2E5BFF; --accent-deep:#1E40C8; --accent-ink:#FFFFFF;
++  --accent-soft:rgba(46,91,255,.08);
+   --queued:#64788D; --running:#B4700F; --running-bg:#FBF1DF;
+   --done:#237A4B; --done-bg:#E4F3EA; --failed:#B23B32; --failed-bg:#F9E7E4;
+   --stream-bg:#10161E; --stream-ink:#D8E2EC;
+   --emblem-l:26%; --emblem-l2:36%; --emblem-s:45%; --glyph-l:62%;
+-  --radius:12px;
++  --radius:14px; --radius-lg:20px;
++  --shadow-sm:0 1px 2px rgba(23,32,48,.05),0 4px 14px rgba(23,32,48,.06);
++  --shadow-md:0 2px 4px rgba(23,32,48,.06),0 12px 32px rgba(23,32,48,.12);
++  --shadow-pop:0 8px 28px rgba(46,91,255,.22);
++  --bg-glow-1:rgba(46,91,255,.07); --bg-glow-2:rgba(46,91,255,.035);
+ }
+ @media (prefers-color-scheme: dark){
+   :root:not([data-theme="light"]){
+-    --bg:#0F151C; --surface:#171F29; --surface2:#131A23; --ink:#E6EDF4; --ink2:#8CA0B5;
+-    --line:#28323F; --line2:#37455A;
+-    --accent:#6C8CFF; --accent-ink:#0E1420;
++    --bg:#0E141B; --surface:#161E28; --surface2:#111822; --ink:#E6EDF4; --ink2:#8CA0B5;
++    --line:#26303D; --line2:#354354;
++    --accent:#6C8CFF; --accent-deep:#4A6BF0; --accent-ink:#0E1420;
++    --accent-soft:rgba(108,140,255,.12);
+     --queued:#7E93A8; --running:#EFAA3F; --running-bg:#2C2310;
+     --done:#53C489; --done-bg:#122A1E; --failed:#F07A6D; --failed-bg:#331A17;
+     --stream-bg:#0B1016; --stream-ink:#C9D6E2;
+     --emblem-l:14%; --emblem-l2:22%; --emblem-s:55%; --glyph-l:68%;
++    --shadow-sm:0 1px 2px rgba(0,0,0,.3),0 4px 14px rgba(0,0,0,.28);
++    --shadow-md:0 2px 4px rgba(0,0,0,.35),0 12px 32px rgba(0,0,0,.4);
++    --shadow-pop:0 8px 28px rgba(108,140,255,.25);
++    --bg-glow-1:rgba(108,140,255,.09); --bg-glow-2:rgba(108,140,255,.04);
+   }
+ }
+ :root[data-theme="dark"]{
+-  --bg:#0F151C; --surface:#171F29; --surface2:#131A23; --ink:#E6EDF4; --ink2:#8CA0B5;
+-  --line:#28323F; --line2:#37455A;
+-  --accent:#6C8CFF; --accent-ink:#0E1420;
++  --bg:#0E141B; --surface:#161E28; --surface2:#111822; --ink:#E6EDF4; --ink2:#8CA0B5;
++  --line:#26303D; --line2:#354354;
++  --accent:#6C8CFF; --accent-deep:#4A6BF0; --accent-ink:#0E1420;
++  --accent-soft:rgba(108,140,255,.12);
+   --queued:#7E93A8; --running:#EFAA3F; --running-bg:#2C2310;
+   --done:#53C489; --done-bg:#122A1E; --failed:#F07A6D; --failed-bg:#331A17;
+   --stream-bg:#0B1016; --stream-ink:#C9D6E2;
+   --emblem-l:14%; --emblem-l2:22%; --emblem-s:55%; --glyph-l:68%;
++  --shadow-sm:0 1px 2px rgba(0,0,0,.3),0 4px 14px rgba(0,0,0,.28);
++  --shadow-md:0 2px 4px rgba(0,0,0,.35),0 12px 32px rgba(0,0,0,.4);
++  --shadow-pop:0 8px 28px rgba(108,140,255,.25);
++  --bg-glow-1:rgba(108,140,255,.09); --bg-glow-2:rgba(108,140,255,.04);
+ }
+ html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
+ *,*::before,*::after{box-sizing:inherit}
+ body{
+-  margin:0;min-height:100%;background:var(--bg);color:var(--ink);
++  margin:0;min-height:100%;color:var(--ink);
++  background:
++    radial-gradient(900px 480px at 12% -8%, var(--bg-glow-1), transparent 60%),
++    radial-gradient(760px 420px at 88% 4%, var(--bg-glow-2), transparent 60%),
++    var(--bg);
+   font-family:"Space Grotesk",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+   font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased;
+ }
+-button{font:inherit;cursor:pointer;border:1px solid var(--line2);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 14px}
++button{font:inherit;cursor:pointer;border:1px solid var(--line2);background:var(--surface);color:var(--ink);border-radius:10px;padding:7px 14px;transition:border-color .15s,box-shadow .15s,transform .1s}
++button:hover:not(:disabled){border-color:var(--accent)}
+ button:disabled{opacity:.45;cursor:default}
+ button:focus-visible,textarea:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+-textarea,input,select{font:inherit;color:var(--ink);background:var(--surface2);border:1px solid var(--line);border-radius:8px;padding:9px 12px}
+-h1,h2,h3{letter-spacing:-.01em;margin:0}
++textarea,input,select{font:inherit;color:var(--ink);background:var(--surface2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;transition:border-color .15s,box-shadow .15s}
++textarea:focus,input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);outline:none}
++h1,h2,h3{letter-spacing:-.015em;margin:0}
+ a{color:var(--accent)}
+ 
+ /* ---------- shell ---------- */
+-.shell{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
++.shell{display:grid;grid-template-columns:228px 1fr;min-height:100vh}
+ .sidebar{
+-  background:var(--surface2);border-right:1px solid var(--line);
++  background:var(--surface);border-right:1px solid var(--line);
+   padding:18px 12px calc(18px + env(safe-area-inset-bottom,0px));
+   display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh;overflow-y:auto;
+ }
+ .brand{display:flex;align-items:center;gap:10px;padding:4px 10px 16px}
+-.brand-mark{width:30px;height:30px;flex:none}
+-.brand-name{font-weight:700;font-size:17px}
+-.brand-tag{font-size:12px;color:var(--ink2);line-height:1.2}
++.brand-mark{width:32px;height:32px;flex:none;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-deep));box-shadow:var(--shadow-pop)}
++.brand-name{font-weight:700;font-size:17px;letter-spacing:-.01em}
++.brand-tag{font-size:12px;color:var(--ink2);line-height:1.25}
+ .nav-btn{
+-  display:flex;align-items:center;gap:10px;border:0;background:none;border-radius:8px;
+-  padding:9px 10px;color:var(--ink2);text-align:left;font-weight:500;width:100%;
+-  text-decoration:none;font-size:15px;
++  display:flex;align-items:center;gap:10px;border:0;background:none;border-radius:10px;
++  padding:9px 12px;color:var(--ink2);text-align:left;font-weight:500;width:100%;
++  text-decoration:none;font-size:14.5px;transition:background .15s,color .15s;
+ }
+ .nav-btn svg{width:17px;height:17px;flex:none}
+-.nav-btn:hover{color:var(--ink);background:var(--surface)}
+-.nav-btn.active{color:var(--ink);background:var(--surface);box-shadow:inset 3px 0 0 var(--accent)}
+-.nav-sec{font-size:12px;color:var(--ink2);padding:14px 10px 4px}
+-.nav-agent-dot{width:8px;height:8px;border-radius:50%;flex:none}
++.nav-btn:hover{color:var(--ink);background:var(--surface2)}
++.nav-btn.active{color:var(--ink);background:var(--accent-soft);box-shadow:inset 3px 0 0 var(--accent);font-weight:600}
++.nav-sec{font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--ink2);padding:14px 12px 4px}
++.nav-agent-dot{width:9px;height:9px;border-radius:50%;flex:none;box-shadow:0 0 0 2px var(--surface)}
+ .side-foot{margin-top:auto;padding:10px;font-size:12.5px;color:var(--ink2)}
+ .side-foot b{color:var(--running);font-weight:600}
+ 
+-.main{min-width:0;padding:16px 20px 60px}
+-.topbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
++.main{min-width:0;padding:20px 24px 64px;max-width:1240px}
++.topbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+ .menu-btn{display:none;padding:6px 10px}
+-.tiles{display:flex;gap:10px;flex-wrap:wrap;flex:1}
++.tiles{display:flex;gap:12px;flex-wrap:wrap;flex:1}
+ .tile{
+   flex:1;min-width:120px;background:var(--surface);border:1px solid var(--line);
+-  border-radius:var(--radius);padding:9px 14px;
++  border-radius:var(--radius);padding:10px 16px;box-shadow:var(--shadow-sm);
+ }
+-.tile .val{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.25}
++.tile .val{font-size:21px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.25;letter-spacing:-.01em}
+ .tile .lbl{font-size:12.5px;color:var(--ink2)}
+ .tile.t-run .val{color:var(--running)}
+ .tile.t-done .val{color:var(--done)}
+ 
+-.view-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:4px 0 14px}
+-.view-head h2{font-size:20px;font-weight:700}
++.view-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:6px 0 16px}
++.view-head h2{font-size:21px;font-weight:700}
+ .view-head .sub{color:var(--ink2);font-size:14px}
+ .view-head .spacer{flex:1}
+ 
+ /* ---------- dispatch bar ---------- */
+-.command{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:10px;margin-bottom:20px}
+-.command textarea{width:100%;min-height:58px;resize:vertical}
++.command{
++  background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);
++  padding:16px;display:flex;flex-direction:column;gap:10px;margin-bottom:24px;box-shadow:var(--shadow-sm);
++}
++.command:focus-within{border-color:var(--accent);box-shadow:var(--shadow-pop)}
++.command textarea{width:100%;min-height:58px;resize:vertical;border:0;background:transparent;padding:2px;font-size:15.5px}
++.command textarea:focus{box-shadow:none}
+ .command-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+-.run-btn{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600;padding:8px 20px}
++.run-btn{
++  background:linear-gradient(135deg,var(--accent),var(--accent-deep));border:0;color:#fff;
++  font-weight:700;padding:9px 24px;border-radius:10px;box-shadow:var(--shadow-pop);
++}
++.run-btn:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.06)}
++.run-btn:active:not(:disabled){transform:none}
+ .stop-btn{border-color:var(--failed);color:var(--failed)}
+-.tierbox{display:flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
+-.tierbox button{border:0;border-radius:0;padding:7px 12px;font-size:13px}
+-.tierbox button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);font-weight:600}
++.tierbox{display:flex;border:1px solid var(--line2);border-radius:10px;overflow:hidden;background:var(--surface2)}
++.tierbox button{border:0;border-radius:0;padding:7px 14px;font-size:13px;background:transparent}
++.tierbox button[aria-pressed="true"]{background:var(--surface);color:var(--ink);font-weight:700;box-shadow:var(--shadow-sm)}
+ .command-note{font-size:12.5px;color:var(--ink2)}
+ 
+ /* ---------- agent grid ---------- */
+-.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
++.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}
+ .agent-card{
+-  background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);
+-  overflow:hidden;padding:0;text-align:left;display:flex;flex-direction:column;transition:transform .15s,border-color .2s;
+-  color:inherit;text-decoration:none;font-size:inherit;
++  background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);
++  padding:26px 18px 18px;text-align:center;display:flex;flex-direction:column;align-items:center;
++  box-shadow:var(--shadow-sm);color:inherit;text-decoration:none;font-size:inherit;
++  transition:transform .18s ease,box-shadow .22s ease,border-color .2s;
+ }
+-.agent-card:hover{transform:translateY(-2px);border-color:var(--line2)}
++.agent-card:hover{transform:translateY(-4px);box-shadow:var(--shadow-md);border-color:var(--line2)}
+ @media (prefers-reduced-motion:reduce){.agent-card:hover{transform:none}}
+-.emblem{position:relative;aspect-ratio:16/8.5;width:100%;display:block}
+-.emblem svg{position:absolute;inset:0;width:100%;height:100%}
+-.emblem-photo{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 20%}
+-.badge{
+-  position:absolute;top:10px;right:10px;font-size:11.5px;font-weight:600;border-radius:20px;
+-  padding:2px 10px;background:var(--surface);color:var(--queued);border:1px solid var(--line);
++.agent-photo-ring{position:relative;width:128px;height:128px;flex:none;margin:2px 0 18px}
++.agent-photo{
++  display:block;position:relative;width:100%;height:100%;border-radius:50%;overflow:hidden;
++  border:3px solid hsl(var(--hue,220) 68% 60%);
++  box-shadow:0 0 0 4px var(--surface),0 10px 24px rgba(20,30,50,.2);
++  background:linear-gradient(135deg,hsl(var(--hue,220) 60% 88%),hsl(calc(var(--hue,220) + 34) 60% 80%));
++}
++.emblem-photo{
++  position:absolute;inset:0;width:100%;height:100%;
++  object-fit:cover;object-position:center 22%;
+ }
+-.badge.running{color:var(--running);background:var(--running-bg);border-color:transparent}
+-.agent-card-body{padding:12px 14px 13px;display:block}
+-.agent-nm{font-weight:700;font-size:16.5px}
+-.agent-rl{color:var(--ink2);font-size:13.5px;margin-bottom:10px}
+-.stat-row{display:flex;gap:6px}
+-.stat{flex:1;background:var(--surface2);border-radius:8px;padding:6px 8px;min-width:0}
+-.stat .v{font-weight:700;font-size:15px;font-variant-numeric:tabular-nums}
+-.stat .k{font-size:11.5px;color:var(--ink2);white-space:nowrap}
++.agent-photo svg{position:absolute;inset:0;width:100%;height:100%}
++.agent-status-pill{
++  position:absolute;left:50%;bottom:-8px;transform:translateX(-50%);
++  font-size:11px;font-weight:700;letter-spacing:.02em;border-radius:20px;white-space:nowrap;
++  padding:3px 12px;background:var(--surface);color:var(--ink2);border:1px solid var(--line);
++  box-shadow:var(--shadow-sm);
++}
++.agent-status-pill.running{color:var(--running);background:var(--running-bg);border-color:transparent}
++.agent-nm{font-weight:700;font-size:18px;letter-spacing:-.01em}
++.agent-rl{color:var(--ink2);font-size:13px;margin:3px 0 14px;max-width:100%}
++.stat-row{display:flex;gap:8px;width:100%}
++.stat{flex:1;background:var(--surface2);border:1px solid var(--line);border-radius:12px;padding:8px 6px;min-width:0}
++.stat .v{font-weight:700;font-size:16px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
++.stat .k{font-size:11px;color:var(--ink2);white-space:nowrap;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+ .slot-card{
+-  border:1.5px dashed var(--line2);border-radius:var(--radius);display:flex;flex-direction:column;
+-  align-items:center;justify-content:center;gap:8px;color:var(--ink2);background:none;min-height:220px;
++  border:1.5px dashed var(--line2);border-radius:var(--radius-lg);display:flex;flex-direction:column;
++  align-items:center;justify-content:center;gap:8px;color:var(--ink2);background:var(--surface2);
++  min-height:280px;transition:border-color .2s,color .2s,background .2s;
+ }
+-.slot-card:hover{color:var(--ink);border-color:var(--accent)}
+-.slot-plus{font-size:30px;line-height:1;font-weight:400}
++.slot-card:hover{color:var(--ink);border-color:var(--accent);background:var(--accent-soft)}
++.slot-plus{font-size:34px;line-height:1;font-weight:300}
+ 
+ /* ---------- agent detail ---------- */
+ .detail-hero{
+-  display:flex;gap:18px;align-items:center;background:var(--surface);border:1px solid var(--line);
+-  border-radius:var(--radius);padding:16px;margin-bottom:16px;flex-wrap:wrap;
++  display:flex;gap:22px;align-items:center;background:var(--surface);border:1px solid var(--line);
++  border-radius:var(--radius-lg);padding:22px;margin-bottom:18px;flex-wrap:wrap;box-shadow:var(--shadow-sm);
++}
++.detail-emblem{
++  width:136px;height:136px;border-radius:50%;overflow:hidden;flex:none;position:relative;
++  border:3px solid hsl(var(--hue,220) 68% 60%);
++  box-shadow:0 0 0 4px var(--surface),0 10px 24px rgba(20,30,50,.2);
++  background:var(--surface2);
+ }
+-.detail-emblem{width:150px;border-radius:10px;overflow:hidden;flex:none;position:relative;aspect-ratio:16/9}
+ .detail-emblem svg{position:absolute;inset:0;width:100%;height:100%}
+ .detail-info{flex:1;min-width:200px}
+-.detail-info h2{font-size:22px}
+-.detail-info .rl{color:var(--ink2);margin:2px 0 10px}
++.detail-info h2{font-size:24px}
++.detail-info .rl{color:var(--ink2);margin:3px 0 12px;font-size:14.5px}
+ .detail-stats{display:flex;gap:8px;flex-wrap:wrap}
+-.detail-stats .stat{flex:none;min-width:96px}
++.detail-stats .stat{flex:none;min-width:100px}
+ .subagent-empty{color:var(--ink2);border:1px dashed var(--line2);border-radius:var(--radius);padding:24px;text-align:center}
+ 
+ /* ---------- workflows ---------- */
+-.wf-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;margin-bottom:24px}
+-.wf-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:8px}
++.wf-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;margin-bottom:24px}
++.wf-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:18px;display:flex;flex-direction:column;gap:8px;box-shadow:var(--shadow-sm);transition:transform .16s,box-shadow .2s}
++.wf-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
+ .wf-card h3{font-size:16px}
+ .wf-card .desc{color:var(--ink2);font-size:13.5px;flex:1}
+ .wf-team{display:flex;gap:6px;flex-wrap:wrap}
+-.team-chip{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;background:var(--surface2);border-radius:20px;padding:2px 10px;color:var(--ink2)}
++.team-chip{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;background:var(--surface2);border:1px solid var(--line);border-radius:20px;padding:3px 11px;color:var(--ink2)}
+ .wf-actions{display:flex;gap:8px}
+-.wf-form{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px;display:flex;flex-direction:column;gap:12px;max-width:640px}
++.wf-form{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:20px;display:flex;flex-direction:column;gap:12px;max-width:640px;box-shadow:var(--shadow-sm)}
+ .wf-form label{font-size:13.5px;color:var(--ink2);display:flex;flex-direction:column;gap:5px}
+ .team-picks{display:flex;gap:8px;flex-wrap:wrap}
+-.team-pick{border-radius:20px;padding:5px 13px;font-size:13.5px}
+-.team-pick[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
++.team-pick{border-radius:20px;padding:6px 14px;font-size:13.5px}
++.team-pick[aria-pressed="true"]{background:linear-gradient(135deg,var(--accent),var(--accent-deep));color:#fff;border-color:transparent;font-weight:600;box-shadow:var(--shadow-pop)}
+ 
+ /* ---------- runs / cards ---------- */
+ .run{margin-top:20px}
+@@ -170,8 +219,8 @@ a{color:var(--accent)}
+ .node.depth2::before{width:46px;left:-51px}
+ .node.depth3{margin-left:60px}
+ .node.depth3::before{width:76px;left:-81px}
+-.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;transition:border-color .25s}
+-.card.running{border-color:var(--running)}
++.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;transition:border-color .25s,box-shadow .25s;box-shadow:var(--shadow-sm)}
++.card.running{border-color:var(--running);box-shadow:var(--shadow-md)}
+ .card.failed{border-color:var(--failed)}
+ .card-top{display:flex;align-items:center;gap:10px;padding:11px 14px;flex-wrap:wrap;background:none;border:0;width:100%;text-align:left;border-radius:0;color:inherit}
+ .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--queued)}
+@@ -182,7 +231,7 @@ a{color:var(--accent)}
+ @media (prefers-reduced-motion:reduce){.card.running .dot{animation:none}.caret{transition:none}}
+ .node-name{font-weight:600}
+ .node-role{color:var(--ink2);font-size:13.5px;flex:1;min-width:110px}
+-.parent-chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;background:var(--surface2);border-radius:20px;padding:2px 9px;color:var(--ink2)}
++.parent-chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;background:var(--surface2);border:1px solid var(--line);border-radius:20px;padding:2px 9px;color:var(--ink2)}
+ .status{font-size:12.5px;font-weight:600;border-radius:20px;padding:2px 10px;color:var(--queued);background:var(--surface2)}
+ .card.running .status{color:var(--running);background:var(--running-bg)}
+ .card.done .status{color:var(--done);background:var(--done-bg)}
+@@ -201,30 +250,34 @@ a{color:var(--accent)}
+ .card-actions{display:flex;gap:8px;padding:8px 12px;border-top:1px solid var(--line);flex-wrap:wrap}
+ .card-actions button{font-size:13px;padding:5px 12px}
+ .err-note{font-size:13px;color:var(--failed);padding:0 14px 10px}
+-.empty{border:1px dashed var(--line2);border-radius:var(--radius);padding:32px 20px;text-align:center;color:var(--ink2)}
++.empty{border:1px dashed var(--line2);border-radius:var(--radius);padding:32px 20px;text-align:center;color:var(--ink2);background:var(--surface)}
+ .empty b{color:var(--ink);font-weight:600;display:block;margin-bottom:4px;font-size:16px}
+ 
+ /* ---------- activity ---------- */
+-.feed{display:flex;flex-direction:column;gap:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+-.feed-item{display:flex;gap:12px;padding:10px 14px;border-bottom:1px solid var(--line);font-size:13.5px;align-items:baseline}
++.feed{display:flex;flex-direction:column;gap:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow-sm)}
++.feed-item{display:flex;gap:12px;padding:10px 14px;border-bottom:1px solid var(--line);font-size:13.5px;align-items:baseline;transition:background .12s}
++a.feed-item{color:inherit;text-decoration:none}
++a.feed-item:hover{background:var(--accent-soft)}
+ .feed-item:last-child{border-bottom:0}
+ .feed-time{color:var(--ink2);font-variant-numeric:tabular-nums;flex:none;font-size:12.5px;width:60px}
+ .home-cols{display:grid;grid-template-columns:1fr 300px;gap:16px;margin-top:22px;align-items:start}
+-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
++.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:16px;box-shadow:var(--shadow-sm)}
+ .panel h3{font-size:15px;margin-bottom:10px}
+ .qa-btns{display:flex;flex-direction:column;gap:8px}
+-.qa-btns button,.qa-btns a{text-align:left;display:block;border:1px solid var(--line2);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 14px;text-decoration:none;font-size:15px}
++.qa-btns button,.qa-btns a{text-align:left;display:block;border:1px solid var(--line2);background:var(--surface);color:var(--ink);border-radius:10px;padding:8px 14px;text-decoration:none;font-size:14.5px;transition:border-color .15s,background .15s}
++.qa-btns button:hover,.qa-btns a:hover{border-color:var(--accent);background:var(--accent-soft)}
+ 
+ /* ---------- modal ---------- */
+ dialog{
+-  border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);color:var(--ink);
+-  padding:18px;max-width:440px;width:calc(100% - 40px);
++  border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface);color:var(--ink);
++  padding:20px;max-width:440px;width:calc(100% - 40px);box-shadow:var(--shadow-md);
+ }
+-dialog::backdrop{background:rgba(10,14,20,.55)}
++dialog::backdrop{background:rgba(10,14,20,.55);backdrop-filter:blur(2px)}
+ dialog form{display:flex;flex-direction:column;gap:12px}
+ dialog label{font-size:13.5px;color:var(--ink2);display:flex;flex-direction:column;gap:5px}
+ .hue-picks{display:flex;gap:8px}
+-.hue-pick{width:30px;height:30px;border-radius:50%;padding:0;border:2px solid transparent}
++.hue-pick{width:30px;height:30px;border-radius:50%;padding:0;border:2px solid transparent;transition:transform .12s}
++.hue-pick:hover{transform:scale(1.12)}
+ .hue-pick[aria-pressed="true"]{border-color:var(--ink)}
+ .dlg-row{display:flex;gap:8px;justify-content:flex-end}
+ .form-err{font-size:13px;color:var(--failed)}
+@@ -236,30 +289,78 @@ dialog label{font-size:13.5px;color:var(--ink2);display:flex;flex-direction:colu
+   .menu-btn{display:inline-block}
+   .home-cols{grid-template-columns:1fr}
+   .main{padding:12px 12px 48px}
++  .agent-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
++  .agent-photo-ring{width:104px;height:104px}
+ }
+ @media (prefers-reduced-motion:reduce){.sidebar{transition:none}}
+ .scrim{display:none;position:fixed;inset:0;background:rgba(10,14,20,.4);z-index:25}
+ .scrim.show{display:block}
+ 
+ /* ---------- approvals (M2) ---------- */
+-.nav-badge{margin-left:auto;background:var(--accent);color:var(--accent-ink);font-size:11.5px;font-weight:700;border-radius:12px;padding:1px 8px;font-variant-numeric:tabular-nums}
+-.appr-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px;margin-bottom:12px}
++.nav-badge{margin-left:auto;background:linear-gradient(135deg,var(--accent),var(--accent-deep));color:#fff;font-size:11.5px;font-weight:700;border-radius:12px;padding:1px 8px;font-variant-numeric:tabular-nums}
++.appr-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:16px;margin-bottom:12px;box-shadow:var(--shadow-sm)}
+ .appr-top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+ .appr-title{font-size:15.5px;font-weight:600}
+ .appr-meta{font-size:12.5px;color:var(--ink2)}
+-.appr-payload{background:var(--surface2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-family:var(--mono,monospace);font-size:12.5px;white-space:pre-wrap;word-break:break-word;margin:10px 0;max-height:220px;overflow:auto}
++.appr-payload{background:var(--surface2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-family:var(--mono,monospace);font-size:12.5px;white-space:pre-wrap;word-break:break-word;margin:10px 0;max-height:220px;overflow:auto}
+ .appr-actions{display:flex;gap:8px;flex-wrap:wrap}
+-.btn{border:1px solid var(--line2);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 16px;font-size:14px;cursor:pointer}
++.btn{border:1px solid var(--line2);background:var(--surface);color:var(--ink);border-radius:10px;padding:7px 16px;font-size:14px;cursor:pointer;transition:border-color .15s,box-shadow .15s}
+ .btn:hover{border-color:var(--accent)}
+-.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
++.btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-deep));border:0;color:#fff;font-weight:600;box-shadow:var(--shadow-pop)}
+ .btn.danger{color:var(--failed);border-color:var(--failed)}
+ .btn:disabled{opacity:.5;cursor:default}
+-.appr-edit{width:100%;min-height:110px;font-family:var(--mono,monospace);font-size:12.5px;border:1px solid var(--line2);border-radius:8px;padding:10px;background:var(--surface);color:var(--ink);margin:8px 0}
++.appr-edit{width:100%;min-height:110px;font-family:var(--mono,monospace);font-size:12.5px;border:1px solid var(--line2);border-radius:10px;padding:10px;background:var(--surface);color:var(--ink);margin:8px 0}
+ .appr-err{font-size:13px;color:var(--failed);margin-top:8px}
+-.run-row{display:flex;align-items:baseline;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;margin-bottom:10px;text-decoration:none;color:var(--ink)}
+-.run-row:hover{border-color:var(--accent)}
++.run-row{display:flex;align-items:baseline;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;margin-bottom:10px;text-decoration:none;color:var(--ink);box-shadow:var(--shadow-sm);transition:border-color .15s,transform .15s}
++.run-row:hover{border-color:var(--accent);transform:translateX(2px)}
+ .run-task{font-size:14.5px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .run-time{font-size:12.5px;color:var(--ink2);flex:none}
+-.card.awaiting_approval .status{color:var(--accent);background:var(--surface2)}
+-.node-out{background:var(--surface2);border-radius:8px;padding:8px 12px;font-size:13px;margin-top:8px;white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto}
++
++/* ---------- run result ---------- */
++.result-panel{
++  background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);
++  padding:18px 20px;margin:2px 0 20px;box-shadow:var(--shadow-sm);
++  border-top:3px solid var(--done);
++}
++.result-panel h2{font-size:15px;margin-bottom:10px;display:flex;align-items:center;gap:9px}
++.result-panel h2::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--done);flex:none}
++.result-body{white-space:pre-wrap;word-break:break-word;font-size:14.5px;line-height:1.7;max-height:520px;overflow:auto}
++.card.awaiting_approval .status{color:var(--accent);background:var(--accent-soft)}
++.node-out{background:var(--surface2);border-radius:10px;padding:8px 12px;font-size:13px;margin-top:8px;white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto}
+ .detail-grid{display:grid;grid-template-columns:1fr;gap:14px}
++
++/* ---------- chat ---------- */
++.chat-wrap{display:flex;gap:16px;align-items:stretch;min-height:60vh}
++.chat-agents{display:flex;flex-direction:column;gap:6px;min-width:190px;max-width:220px}
++.chat-agent{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:12px;border:1px solid transparent;background:transparent;cursor:pointer;color:var(--ink);font-size:14px;text-align:left;transition:background .12s,border-color .12s}
++.chat-agent:hover{background:var(--surface2)}
++.chat-agent.active{background:var(--surface);border-color:var(--line);box-shadow:var(--shadow-sm)}
++.chat-agent-emblem{width:34px;height:34px;flex:none;border-radius:50%;overflow:hidden;background:var(--surface2)}
++.chat-agent-emblem .emblem-photo{width:100%;height:100%;object-fit:cover;object-position:center 22%}
++.chat-agent-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
++.chat-main{flex:1;display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);min-width:0;overflow:hidden}
++.chat-head{display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid var(--line)}
++.chat-head-dot{width:10px;height:10px;border-radius:50%;flex:none}
++.chat-head-name{font-weight:700;font-size:15px}
++.chat-head-role{font-size:12.5px;color:var(--ink2)}
++.chat-messages{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px;min-height:300px;max-height:58vh}
++.chat-empty{color:var(--ink2);font-size:14px;text-align:center;padding:40px 20px}
++.chat-msg{display:flex}
++.chat-msg.user{justify-content:flex-end}
++.chat-msg.assistant{justify-content:flex-start}
++.chat-bubble{max-width:78%;padding:10px 14px;border-radius:16px;font-size:14.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
++.chat-msg.user .chat-bubble{background:linear-gradient(135deg,var(--accent),var(--accent-deep));color:#fff;border-bottom-right-radius:6px}
++.chat-msg.assistant .chat-bubble{background:var(--surface2);color:var(--ink);border-bottom-left-radius:6px}
++.chat-bubble .caret{display:inline-block;width:8px;height:16px;background:var(--accent);margin-left:3px;vertical-align:-2px;animation:blink 1s steps(1) infinite}
++@keyframes blink{50%{opacity:0}}
++.chat-input-row{display:flex;gap:10px;padding:14px 18px;border-top:1px solid var(--line);background:var(--surface)}
++.chat-input{flex:1;border:1px solid var(--line2);border-radius:12px;padding:11px 14px;font-size:14.5px;background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
++.chat-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
++.chat-send{flex:none;padding:11px 22px}
++@media(max-width:760px){
++  .chat-wrap{flex-direction:column}
++  .chat-agents{flex-direction:row;overflow-x:auto;max-width:none;min-width:0;padding-bottom:4px}
++  .chat-agent{flex:none}
++  .chat-agent-name{display:none}
++  .chat-bubble{max-width:88%}
++}
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index 36e8ae0..a545968 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -30,12 +30,23 @@ export default async function CommandCenter() {
+                 <span>Dispatch your first mission to see activity here.</span>
+               </div>
+             ) : (
+-              events.map((e) => (
+-                <div key={e.id} className="feed-item">
+-                  <span className="feed-time">{eventTime(e)}</span>
+-                  <span>{eventText(e)}</span>
+-                </div>
+-              ))
++              events.map((e) => {
++                const inner = (
++                  <>
++                    <span className="feed-time">{eventTime(e)}</span>
++                    <span>{eventText(e)}</span>
++                  </>
++                );
++                return e.runId ? (
++                  <Link key={e.id} href={`/runs/${e.runId}`} className="feed-item">
++                    {inner}
++                  </Link>
++                ) : (
++                  <div key={e.id} className="feed-item">
++                    {inner}
++                  </div>
++                );
++              })
+             )}
+           </div>
+         </div>
+diff --git a/src/app/runs/[id]/page.tsx b/src/app/runs/[id]/page.tsx
+index c80220e..f3091b6 100644
+--- a/src/app/runs/[id]/page.tsx
++++ b/src/app/runs/[id]/page.tsx
+@@ -17,6 +17,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
+     listPendingActions(),
+   ]);
+   const actions = allActions.filter((a) => a.action.runId === id);
++  const synthesis = nodes.find((n) => n.kind === "synthesis" && n.output);
+ 
+   return (
+     <section>
+@@ -30,6 +31,13 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
+       </div>
+       <p style={{ marginBottom: 14 }}>{run.task}</p>
+ 
++      {synthesis && (
++        <div className="result-panel">
++          <h2>Result</h2>
++          <div className="result-body">{synthesis.output}</div>
++        </div>
++      )}
++
+       <RunStream runId={id} initialTerminal={TERMINAL.has(run.status)} />
+ 
+       {actions.length > 0 && (
+diff --git a/src/components/agents/AgentGrid.tsx b/src/components/agents/AgentGrid.tsx
+index 64ccf2a..3932797 100644
+--- a/src/components/agents/AgentGrid.tsx
++++ b/src/components/agents/AgentGrid.tsx
+@@ -16,30 +16,35 @@ export function AgentCard({ agent, stats }: { agent: AgentDTO; stats?: AgentStat
+   const running = (stats?.activeNow ?? 0) > 0;
+   return (
+     <Link href={`/agents/${agent.id}`} className="agent-card">
+-      <span className="emblem">
+-        <Emblem hue={agent.hue} face={agent.face} uid={`card-${agent.id}`} photoUrl={agent.avatarUrl} />
+-        <span className={`badge${running ? " running" : ""}`}>{running ? "Running" : "Idle"}</span>
++      <span
++        className="agent-photo-ring"
++        style={{ "--hue": agent.hue } as React.CSSProperties}
++      >
++        <span className="agent-photo">
++          <Emblem hue={agent.hue} face={agent.face} uid={`card-${agent.id}`} photoUrl={agent.avatarUrl} />
++        </span>
++        <span className={`agent-status-pill${running ? " running" : ""}`}>
++          {running ? "Running" : "Idle"}
++        </span>
+       </span>
+-      <span className="agent-card-body">
+-        <span className="agent-nm">{agent.name}</span>
+-        <div className="agent-rl">{agent.role}</div>
+-        <div className="stat-row">
+-          <span className="stat">
+-            <span className="v">{total}</span>
+-            <br />
+-            <span className="k">Tasks</span>
+-          </span>
+-          <span className="stat">
+-            <span className="v">{fmtRate(stats)}</span>
+-            <br />
+-            <span className="k">Success</span>
+-          </span>
+-          <span className="stat">
+-            <span className="v">{fmtAvg(stats)}</span>
+-            <br />
+-            <span className="k">Avg time</span>
+-          </span>
+-        </div>
++      <span className="agent-nm">{agent.name}</span>
++      <span className="agent-rl">{agent.role}</span>
++      <span className="stat-row">
++        <span className="stat">
++          <span className="v">{total}</span>
++          <br />
++          <span className="k">Tasks</span>
++        </span>
++        <span className="stat">
++          <span className="v">{fmtRate(stats)}</span>
++          <br />
++          <span className="k">Success</span>
++        </span>
++        <span className="stat">
++          <span className="v">{fmtAvg(stats)}</span>
++          <br />
++          <span className="k">Avg time</span>
++        </span>
+       </span>
+     </Link>
+   );
+diff --git a/src/components/chat/ChatClient.tsx b/src/components/chat/ChatClient.tsx
+new file mode 100644
+index 0000000..4b954a5
+--- /dev/null
++++ b/src/components/chat/ChatClient.tsx
+@@ -0,0 +1,200 @@
++"use client";
++
++import { useEffect, useRef, useState } from "react";
++import { Emblem } from "@/components/avatar/Emblem";
++import type { AgentDTO } from "@/lib/types";
++import type { ChatMessageDTO } from "@/server/chat";
++
++interface Props {
++  agents: AgentDTO[];
++  initialAgentId: string;
++  initialMessages: ChatMessageDTO[];
++}
++
++export function ChatClient({ agents, initialAgentId, initialMessages }: Props) {
++  const [agentId, setAgentId] = useState(initialAgentId);
++  const [messages, setMessages] = useState<ChatMessageDTO[]>(initialMessages);
++  const [input, setInput] = useState("");
++  const [sending, setSending] = useState(false);
++  const [streaming, setStreaming] = useState("");
++  const bottomRef = useRef<HTMLDivElement>(null);
++
++  const agent = agents.find((a) => a.id === agentId);
++
++  useEffect(() => {
++    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
++  }, [messages, streaming]);
++
++  async function switchAgent(id: string) {
++    if (id === agentId || sending) return;
++    setAgentId(id);
++    setMessages([]);
++    setStreaming("");
++    try {
++      const res = await fetch(`/api/chat/${id}`);
++      if (res.ok) {
++        const data = await res.json();
++        setMessages(data.messages ?? []);
++      }
++    } catch {
++      /* history stays empty on failure */
++    }
++  }
++
++  async function send() {
++    const content = input.trim();
++    if (!content || sending) return;
++    setInput("");
++    setSending(true);
++
++    const userMsg: ChatMessageDTO = {
++      id: `local-${Date.now()}`,
++      role: "user",
++      content,
++      at: new Date().toISOString(),
++    };
++    setMessages((m) => [...m, userMsg]);
++    setStreaming("");
++
++    try {
++      const res = await fetch(`/api/chat/${agentId}`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ content }),
++      });
++      if (!res.ok || !res.body) {
++        const err = await res.json().catch(() => null);
++        throw new Error(err?.error ?? "Couldn't reach your teammate.");
++      }
++      const reader = res.body.getReader();
++      const decoder = new TextDecoder();
++      let buffer = "";
++      let acc = "";
++      for (;;) {
++        const { done, value } = await reader.read();
++        if (done) break;
++        buffer += decoder.decode(value, { stream: true });
++        const parts = buffer.split("\n\n");
++        buffer = parts.pop() ?? "";
++        for (const part of parts) {
++          const lines = part.split("\n");
++          let event = "";
++          let data = "";
++          for (const line of lines) {
++            if (line.startsWith("event:")) event = line.slice(6).trim();
++            else if (line.startsWith("data:")) data = line.slice(5).trim();
++          }
++          if (!data) continue;
++          try {
++            const payload = JSON.parse(data);
++            if (event === "delta" && typeof payload.text === "string") {
++              acc += payload.text;
++              setStreaming(acc);
++            } else if (event === "done" && payload.message) {
++              setMessages((m) => [...m, payload.message]);
++              acc = "";
++              setStreaming("");
++            } else if (event === "error") {
++              throw new Error(payload.error ?? "Reply failed.");
++            }
++          } catch (e) {
++            if (e instanceof SyntaxError) continue;
++            throw e;
++          }
++        }
++      }
++      // Fallback: if the stream ended without a done event, keep what streamed.
++      if (acc) {
++        setMessages((m) => [
++          ...m,
++          { id: `local-${Date.now()}-a`, role: "assistant", content: acc, at: new Date().toISOString() },
++        ]);
++        setStreaming("");
++      }
++    } catch (err) {
++      setStreaming("");
++      setMessages((m) => [
++        ...m,
++        {
++          id: `local-${Date.now()}-e`,
++          role: "assistant",
++          content: `Couldn't get a reply: ${err instanceof Error ? err.message : "unknown error"}`,
++          at: new Date().toISOString(),
++        },
++      ]);
++    } finally {
++      setSending(false);
++    }
++  }
++
++  return (
++    <div className="chat-wrap">
++      <div className="chat-agents" role="tablist" aria-label="Teammates">
++        {agents.map((a) => (
++          <button
++            key={a.id}
++            role="tab"
++            aria-selected={a.id === agentId}
++            className={`chat-agent${a.id === agentId ? " active" : ""}`}
++            onClick={() => switchAgent(a.id)}
++          >
++            <span className="chat-agent-emblem">
++              <Emblem hue={a.hue} face={a.face} uid={`chat-${a.id}`} photoUrl={a.avatarUrl} />
++            </span>
++            <span className="chat-agent-name">{a.name}</span>
++          </button>
++        ))}
++      </div>
++
++      <div className="chat-main">
++        <div className="chat-head">
++          <span className="chat-head-dot" style={{ background: `hsl(${agent?.hue ?? 210} 70% 55%)` }} />
++          <div>
++            <div className="chat-head-name">{agent?.name}</div>
++            <div className="chat-head-role">{agent?.role}</div>
++          </div>
++        </div>
++
++        <div className="chat-messages">
++          {messages.length === 0 && !streaming && (
++            <div className="chat-empty">
++              Say hello to {agent?.name} — ask a question, talk through a deal, or think out loud.
++            </div>
++          )}
++          {messages.map((m) => (
++            <div key={m.id} className={`chat-msg ${m.role}`}>
++              <div className="chat-bubble">{m.content}</div>
++            </div>
++          ))}
++          {streaming && (
++            <div className="chat-msg assistant">
++              <div className="chat-bubble streaming">{streaming}<span className="caret" /></div>
++            </div>
++          )}
++          <div ref={bottomRef} />
++        </div>
++
++        <div className="chat-input-row">
++          <input
++            className="chat-input"
++            value={input}
++            onChange={(e) => setInput(e.target.value)}
++            onKeyDown={(e) => {
++              if (e.key === "Enter" && !e.shiftKey) {
++                e.preventDefault();
++                send();
++              }
++            }}
++            placeholder={`Message ${agent?.name ?? "teammate"}…`}
++            maxLength={8000}
++            disabled={sending}
++            aria-label="Chat message"
++          />
++          <button className="btn primary chat-send" onClick={send} disabled={sending || !input.trim()}>
++            {sending ? "…" : "Send"}
++          </button>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/shell/Shell.tsx b/src/components/shell/Shell.tsx
+index 25a9e4e..b041dbb 100644
+--- a/src/components/shell/Shell.tsx
++++ b/src/components/shell/Shell.tsx
+@@ -62,6 +62,15 @@ const NAV = [
+       </svg>
+     ),
+   },
++  {
++    href: "/chat",
++    label: "Chat",
++    icon: (
++      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7">
++        <path d="M3 4.5h14v9H9l-4.5 3.5v-3.5H3v-9Z" strokeLinejoin="round" />
++      </svg>
++    ),
++  },
+ ];
+ 
+ export function Shell({
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index 1a36d16..c148470 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -138,6 +138,24 @@ export const settings = sqliteTable("settings", {
+   value: text("value").notNull(), // JSON
+ });
+ 
++/**
++ * Chat with teammates: one persistent conversation per agent.
++ * Roles are "user" | "assistant"; the API layer enforces the enum with zod.
++ */
++export const chatMessages = sqliteTable(
++  "chat_messages",
++  {
++    id: text("id").primaryKey(),
++    agentId: text("agent_id").references(() => agents.id, { onDelete: "cascade" }),
++    role: text("role").notNull(),
++    content: text("content").notNull(),
++    at: integer("at", { mode: "timestamp_ms" })
++      .notNull()
++      .$defaultFn(() => new Date()),
++  },
++  (t) => [index("chat_messages_agent_at_idx").on(t.agentId, t.at)],
++);
++
+ export type AgentRow = typeof agents.$inferSelect;
+ export type WorkflowRow = typeof workflows.$inferSelect;
+ export type RunRow = typeof runs.$inferSelect;
+diff --git a/src/server/chat.ts b/src/server/chat.ts
+new file mode 100644
+index 0000000..6eeae7b
+--- /dev/null
++++ b/src/server/chat.ts
+@@ -0,0 +1,107 @@
++import { asc, eq } from "drizzle-orm";
++import type Anthropic from "@anthropic-ai/sdk";
++import { db, schema } from "@/db";
++import { newId } from "@/lib/id";
++import { parseSpec } from "@/lib/agentSpec";
++import { streamComplete } from "@/server/engine/model";
++
++export interface ChatMessageDTO {
++  id: string;
++  role: "user" | "assistant";
++  content: string;
++  at: string;
++}
++
++const HISTORY_LIMIT = 40;
++const REPLY_MAX_TOKENS = 1024;
++
++/** Conversation history for an agent, oldest first. */
++export async function getChatMessages(agentId: string): Promise<ChatMessageDTO[]> {
++  const rows = await db
++    .select()
++    .from(schema.chatMessages)
++    .where(eq(schema.chatMessages.agentId, agentId))
++    .orderBy(asc(schema.chatMessages.at))
++    .limit(HISTORY_LIMIT);
++  return rows.map((r) => ({
++    id: r.id,
++    role: r.role as "user" | "assistant",
++    content: r.content,
++    at: r.at.toISOString(),
++  }));
++}
++
++export async function saveChatMessage(
++  agentId: string,
++  role: "user" | "assistant",
++  content: string,
++): Promise<ChatMessageDTO> {
++  const [row] = await db
++    .insert(schema.chatMessages)
++    .values({ id: newId("msg_"), agentId, role, content })
++    .returning();
++  return {
++    id: row!.id,
++    role: role,
++    content: row!.content,
++    at: row!.at.toISOString(),
++  };
++}
++
++export interface ChatAgent {
++  id: string;
++  name: string;
++  systemPrompt: string;
++  model: string;
++}
++
++/** Load the agent row + parsed spec needed to answer as that teammate. */
++export async function loadChatAgent(agentId: string): Promise<ChatAgent | null> {
++  const rows = await db
++    .select()
++    .from(schema.agents)
++    .where(eq(schema.agents.id, agentId))
++    .limit(1);
++  const row = rows[0];
++  if (!row || row.status !== "active") return null;
++  const spec = parseSpec(row.spec, row.name, row.role, row.specialty);
++  return {
++    id: row.id,
++    name: row.name,
++    systemPrompt: spec.systemPrompt,
++    model: spec.model.model,
++  };
++}
++
++function toAnthropicHistory(messages: ChatMessageDTO[]): Anthropic.MessageParam[] {
++  return messages.map((m) => ({ role: m.role, content: m.content }));
++}
++
++/**
++ * Stream the agent's reply to its conversation history.
++ * onDelta receives text chunks; resolves to the full reply text.
++ */
++export async function streamChatReply(
++  agent: ChatAgent,
++  onDelta: (text: string) => void | Promise<void>,
++): Promise<string> {
++  const history = await getChatMessages(agent.id);
++  const stream = streamComplete({
++    model: agent.model,
++    system:
++      agent.systemPrompt +
++      "\n\nYou are chatting directly with Nick, your manager, in the Dispatch dashboard. " +
++      "Be conversational and concise. If he asks you to do work that needs tools or " +
++      "side effects, explain what you'd do and suggest dispatching it as a mission.",
++    messages: toAnthropicHistory(history),
++    maxTokens: REPLY_MAX_TOKENS,
++  });
++  let full = "";
++  stream.on("text", (text) => {
++    full += text;
++    void onDelta(text);
++  });
++  // Resolves when the stream ends; rejects on stream errors.
++  await stream.finalMessage();
++  return full;
++}
+diff --git a/src/server/engine/model.ts b/src/server/engine/model.ts
+index 2fff30c..7ae3718 100644
+--- a/src/server/engine/model.ts
++++ b/src/server/engine/model.ts
+@@ -50,6 +50,17 @@ export async function complete(opts: CompleteOpts): Promise<Anthropic.Message> {
+   });
+ }
+ 
++/** Streaming variant of complete(), for chat-style token-by-token replies. */
++export function streamComplete(opts: CompleteOpts) {
++  return getClient().messages.stream({
++    model: opts.model,
++    system: opts.system,
++    messages: opts.messages,
++    max_tokens: opts.maxTokens,
++    ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools.map(toAnthropicTool) } : {}),
++  });
++}
++
+ /** Concatenate all text blocks of a message. */
+ export function messageText(msg: Anthropic.Message): string {
+   return msg.content
+diff --git a/src/server/validation.ts b/src/server/validation.ts
+index 6ce874f..4740c7f 100644
+--- a/src/server/validation.ts
++++ b/src/server/validation.ts
+@@ -141,6 +141,13 @@ export const runStatusSchema = z.enum(RUN_STATUSES);
+ export const nodeStatusSchema = z.enum(NODE_STATUSES);
+ export const nodeKindSchema = z.enum(NODE_KINDS);
+ 
++/** Chat message from Nick to a teammate. */
++export const chatMessageSchema = z.object({
++  content: z.string().trim().min(1, "Say something first.").max(8000),
++});
++
++export type ChatMessageInput = z.infer<typeof chatMessageSchema>;
++
+ export type CreateAgentInput = z.infer<typeof createAgentSchema>;
+ export type DispatchInput = z.infer<typeof dispatchSchema>;
+ export type Plan = z.infer<typeof planSchema>;

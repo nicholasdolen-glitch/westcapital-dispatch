@@ -141,6 +141,13 @@ export const runStatusSchema = z.enum(RUN_STATUSES);
 export const nodeStatusSchema = z.enum(NODE_STATUSES);
 export const nodeKindSchema = z.enum(NODE_KINDS);
 
+/** Chat message from Nick to a teammate. */
+export const chatMessageSchema = z.object({
+  content: z.string().trim().min(1, "Say something first.").max(8000),
+});
+
+export type ChatMessageInput = z.infer<typeof chatMessageSchema>;
+
 export type CreateAgentInput = z.infer<typeof createAgentSchema>;
 export type DispatchInput = z.infer<typeof dispatchSchema>;
 export type Plan = z.infer<typeof planSchema>;

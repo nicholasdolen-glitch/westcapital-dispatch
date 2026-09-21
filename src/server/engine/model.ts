@@ -50,6 +50,17 @@ export async function complete(opts: CompleteOpts): Promise<Anthropic.Message> {
   });
 }
 
+/** Streaming variant of complete(), for chat-style token-by-token replies. */
+export function streamComplete(opts: CompleteOpts) {
+  return getClient().messages.stream({
+    model: opts.model,
+    system: opts.system,
+    messages: opts.messages,
+    max_tokens: opts.maxTokens,
+    ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools.map(toAnthropicTool) } : {}),
+  });
+}
+
 /** Concatenate all text blocks of a message. */
 export function messageText(msg: Anthropic.Message): string {
   return msg.content

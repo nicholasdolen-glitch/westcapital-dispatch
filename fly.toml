@@ -1,4 +1,4 @@
-app = "westcapital-dispatch"
+app = "wcl-dispatch"
 primary_region = "sjc"
 
 [build]

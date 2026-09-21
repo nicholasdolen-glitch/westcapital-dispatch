@@ -17,6 +17,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
     listPendingActions(),
   ]);
   const actions = allActions.filter((a) => a.action.runId === id);
+  const synthesis = nodes.find((n) => n.kind === "synthesis" && n.output);
 
   return (
     <section>
@@ -29,6 +30,13 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         <span className="status">{run.status}</span>
       </div>
       <p style={{ marginBottom: 14 }}>{run.task}</p>
+
+      {synthesis && (
+        <div className="result-panel">
+          <h2>Result</h2>
+          <div className="result-body">{synthesis.output}</div>
+        </div>
+      )}
 
       <RunStream runId={id} initialTerminal={TERMINAL.has(run.status)} />
 

@@ -16,30 +16,35 @@ export function AgentCard({ agent, stats }: { agent: AgentDTO; stats?: AgentStat
   const running = (stats?.activeNow ?? 0) > 0;
   return (
     <Link href={`/agents/${agent.id}`} className="agent-card">
-      <span className="emblem">
-        <Emblem hue={agent.hue} face={agent.face} uid={`card-${agent.id}`} photoUrl={agent.avatarUrl} />
-        <span className={`badge${running ? " running" : ""}`}>{running ? "Running" : "Idle"}</span>
+      <span
+        className="agent-photo-ring"
+        style={{ "--hue": agent.hue } as React.CSSProperties}
+      >
+        <span className="agent-photo">
+          <Emblem hue={agent.hue} face={agent.face} uid={`card-${agent.id}`} photoUrl={agent.avatarUrl} />
+        </span>
+        <span className={`agent-status-pill${running ? " running" : ""}`}>
+          {running ? "Running" : "Idle"}
+        </span>
       </span>
-      <span className="agent-card-body">
-        <span className="agent-nm">{agent.name}</span>
-        <div className="agent-rl">{agent.role}</div>
-        <div className="stat-row">
-          <span className="stat">
-            <span className="v">{total}</span>
-            <br />
-            <span className="k">Tasks</span>
-          </span>
-          <span className="stat">
-            <span className="v">{fmtRate(stats)}</span>
-            <br />
-            <span className="k">Success</span>
-          </span>
-          <span className="stat">
-            <span className="v">{fmtAvg(stats)}</span>
-            <br />
-            <span className="k">Avg time</span>
-          </span>
-        </div>
+      <span className="agent-nm">{agent.name}</span>
+      <span className="agent-rl">{agent.role}</span>
+      <span className="stat-row">
+        <span className="stat">
+          <span className="v">{total}</span>
+          <br />
+          <span className="k">Tasks</span>
+        </span>
+        <span className="stat">
+          <span className="v">{fmtRate(stats)}</span>
+          <br />
+          <span className="k">Success</span>
+        </span>
+        <span className="stat">
+          <span className="v">{fmtAvg(stats)}</span>
+          <br />
+          <span className="k">Avg time</span>
+        </span>
       </span>
     </Link>
   );

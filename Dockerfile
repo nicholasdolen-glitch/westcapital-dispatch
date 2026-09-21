@@ -36,7 +36,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/drizzle.config.ts ./drizzle.confi
 COPY --from=builder --chown=nextjs:nodejs /app/src ./src
 COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
 COPY --chown=nextjs:nodejs entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
+# Strip any Windows (CRLF) line endings: a stray \r breaks the #!/bin/sh
+# shebang and the machine crash-loops with "No such file or directory".
+RUN chmod +x ./entrypoint.sh && sed -i 's/\r$//' ./entrypoint.sh
 
 USER nextjs
 EXPOSE 8080
